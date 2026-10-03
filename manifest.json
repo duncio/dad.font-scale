@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "dad.font-scale",
+  "name": "Font Size",
+  "version": "1.0.0",
+  "author": "Dad",
+  "description": "Control font sizes independently for the terminal, GTK apps, and the Omarchy shell.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Font Size",
+    "description": "Set terminal, GTK app, and shell font sizes",
+    "category": "Appearance",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

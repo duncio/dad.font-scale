@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Font Size Control — terminal (foot), GTK apps (gsettings), Omarchy shell
+# ==============================================================================
+
+set -euo pipefail
+
+STATE_FILE="$HOME/.local/state/omarchy/font-size/state.env"
+GKEY_SCHEMA="org.gnome.desktop.interface"
+GKEY_FACTOR="${GKEY_SCHEMA}.text-scaling-factor"
+FOOT_CFG="$HOME/.config/foot/foot.ini"
+SHELL_TOML="$HOME/.config/omarchy/shell.toml"
+MIN=8
+MAX=20
+
+TERMINAL_PT=11
+GTK_PT=11
+SHELL_PX=12
+
+load_state() {
+  if [[ -f "$STATE_FILE" ]]; then
+    source "$STATE_FILE" 2>/dev/null || true
+  fi
+  : "${TERMINAL_PT:=11}"
+  : "${GTK_PT:=11}"
+  : "${SHELL_PX:=12}"
+}
+
+save_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cat > "$STATE_FILE" <<EOF
+TERMINAL_PT=${TERMINAL_PT}
+GTK_PT=${GTK_PT}
+SHELL_PX=${SHELL_PX}
+EOF
+}
+
+clamp() {
+  local val="$1"
+  if (( val < MIN )); then echo "$MIN"
+  elif (( val > MAX )); then echo "$MAX"
+  else echo "$val"
+  fi
+}
+
+# ---- read live values -------------------------------------------------------
+
+# Point size of the GTK interface font (font-name); used to convert an
+# "effective" display size into text-scaling-factor.
+gtk_font_pt() {
+  local name pt
+  name="$(gsettings get "$GKEY_SCHEMA" font-name 2>/dev/null)"
+  [[ -n "$name" ]] || { echo 11; return; }
+  pt="${name%\'}"
+  pt="${pt##* }"
+  if [[ $pt =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$pt"; else echo 11; fi
+}
+
+gtk_font_factor() {
+  gsettings get "$GKEY_SCHEMA" text-scaling-factor 2>/dev/null | tr -d "'"
+}
+
+# Effective GTK text size in pt (rounded); what the user actually sees.
+current_gtk_pt() {
+  local factor base
+  factor="$(gtk_font_factor)"
+  base="$(gtk_font_pt)"
+  if [[ "$factor" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    awk -v f="$factor" -v b="$base" 'BEGIN { printf "%d", f * b + 0.5 }'
+  else
+    echo "$base"
+  fi
+}
+
+# Current terminal point size from the foot config (foot reads config at start).
+current_terminal_pt() {
+  if [[ -f "$FOOT_CFG" ]]; then
+    local pt
+    pt="$(grep -oP ':size=\K[0-9.]+' "$FOOT_CFG" 2>/dev/null | head -1)"
+    [[ -n "$pt" ]] && echo "$pt" || echo 11
+  else
+    echo 11
+  fi
+}
+
+# Current shell base-size (the rem root for every shell type size) in px.
+current_shell_px() {
+  if [[ -f "$SHELL_TOML" ]]; then
+    local px
+    px="$(awk '
+      /^[[:space:]]*\[/ { if (in_font) exit; in_font = ($0 ~ /^[[:space:]]*\[font\][[:space:]]*$/) }
+      in_font && /^[[:space:]]*base-size[[:space:]]*=/ {
+        v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]*(#.*)?$/, "", v); print v; exit
+      }
+    ' "$SHELL_TOML" 2>/dev/null)"
+    [[ -n "$px" ]] && echo "$px" || echo 12
+  else
+    echo 12
+  fi
+}
+
+# ---- setters ----------------------------------------------------------------
+
+set_terminal() {
+  local pt="$1"
+  if [[ -f "$FOOT_CFG" ]]; then
+    if grep -q "font=.*:size=" "$FOOT_CFG"; then
+      sed -i -E "s/(:size=)[0-9.]+/\1${pt}/" "$FOOT_CFG"
+    elif grep -q "^[[:space:]]*font=" "$FOOT_CFG"; then
+      sed -i -E "s/^([[:space:]]*font=.*)/\1:size=${pt}/" "$FOOT_CFG"
+    fi
+    # Foot has no config-reload signal; new windows pick the size up.
+    if pgrep -x foot >/dev/null 2>&1; then
+      omarchy-notification-send "New foot windows will use ${pt}pt" "" 2>/dev/null || true
+    fi
+  fi
+  TERMINAL_PT="$pt"
+  save_state
+}
+
+set_gtk() {
+  local pt="$1" base factor
+  base="$(gtk_font_pt)"
+  factor="$(awk -v p="$pt" -v b="$base" 'BEGIN { printf "%.4f", p / b }')"
+  gsettings set "$GKEY_SCHEMA" text-scaling-factor "$factor" 2>/dev/null || true
+  GTK_PT="$pt"
+  save_state
+}
+
+set_shell() {
+  local px="$1"
+  mkdir -p "$(dirname "$SHELL_TOML")"
+  if [[ -f "$SHELL_TOML" ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v val="$px" '
+      function emit() { print "base-size = " val; done = 1 }
+      /^[[:space:]]*\[/ {
+        if (in_font && !done) emit()
+        in_font = ($0 ~ /^[[:space:]]*\[font\][[:space:]]*$/)
+        print
+        next
+      }
+      in_font && /^[[:space:]]*base-size[[:space:]]*=/ { if (!done) emit(); next }
+      { print }
+      END {
+        if (in_font && !done) emit()
+        if (!done) { if (NR > 0) print ""; print "[font]"; emit() }
+      }
+    ' "$SHELL_TOML" >"$tmp"
+    mv "$tmp" "$SHELL_TOML"
+  else
+    printf '[font]\nbase-size = %s\n' "$px" >"$SHELL_TOML"
+  fi
+
+  # Shell watches ~/.config/omarchy/shell.toml and hot-reloads it; push it
+  # explicitly too so the base-size reflows immediately.
+  local colors_b64 shell_b64
+  colors_b64="$(base64 -w 0 < "$HOME/.local/state/omarchy/current/theme/colors.toml" 2>/dev/null || true)"
+  shell_b64="$(base64 -w 0 < "$SHELL_TOML" 2>/dev/null || true)"
+  if [[ -n "$colors_b64" && -n "$shell_b64" ]] && command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell -q shell applyTheme "$colors_b64" "$shell_b64" >/dev/null 2>&1 || true
+  fi
+
+  SHELL_PX="$px"
+  save_state
+}
+
+sync_from_live() {
+  TERMINAL_PT="$(current_terminal_pt)"
+  GTK_PT="$(current_gtk_pt)"
+  SHELL_PX="$(current_shell_px)"
+  save_state
+}
+
+case "${1:-}" in
+  get)
+    sync_from_live
+    printf 'TERMINAL_PT=%s\nGTK_PT=%s\nSHELL_PX=%s\n' "$TERMINAL_PT" "$GTK_PT" "$SHELL_PX"
+    ;;
+  terminal)
+    if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+      set_terminal "$(clamp "$2")"
+    else
+      echo "Usage: $0 terminal <pt ($MIN-$MAX)>" >&2; exit 1
+    fi
+    ;;
+  gtk)
+    if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+      set_gtk "$(clamp "$2")"
+    else
+      echo "Usage: $0 gtk <pt ($MIN-$MAX)>" >&2; exit 1
+    fi
+    ;;
+  shell)
+    if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+      set_shell "$(clamp "$2")"
+    else
+      echo "Usage: $0 shell <px ($MIN-$MAX)>" >&2; exit 1
+    fi
+    ;;
+  reset-all)
+    set_terminal 11
+    set_gtk 11
+    set_shell 12
+    ;;
+  *)
+    echo "Usage: $0 {get|terminal <pt>|gtk <pt>|shell <px>|reset-all}" >&2
+    exit 1
+    ;;
+esac
